@@ -105,6 +105,12 @@ export function makeAutopilot(sim: Sim) {
       if (s.t - lastAct > 20 * 60 && !s.lab.actPending) { requestAct(s); lastAct = s.t; }
       const la = s.lab.lastAct;
       if (la && la.value < 480 && la.tSample !== hepFor) { giveDrug(s, 'heparin'); hepFor = la.tSample; lastAct = s.t - 17 * 60; }
+      // in-line monitor: store, sample both sides, then calibrate against the results
+      if (s.cdi.calT === null && s.t > s.tm.cpbStart! + 120 && !s.flags.flowDown) {
+        const st = s.cdi.stored;
+        if (!st) { sim.cdiStore(); requestBga(s, 'a'); requestBga(s, 'v'); }
+        else if (s.lab.lastBga && s.lab.lastBga.tSample >= st.t && s.lab.lastVbg && s.lab.lastVbg.tSample >= st.t) sim.cdiCal();
+      }
       // cardioplegia
       if (g.xclamp) {
         if (!cpRun && (sim.phase === 'induction' ? cp.doseVol < cp.target : s.t - cp.lastFlowT > 20 * 60)) cpRun = true;

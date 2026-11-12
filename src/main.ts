@@ -39,7 +39,7 @@ function render() {
     root.append(buildSetup(cfg, (c) => { cfg = c; sim = new Sim(c); debriefShown = false; render(); }, toggleLang));
     return;
   }
-  dash = new Dashboard(sim, showDebrief, toggleLang);
+  dash = new Dashboard(sim, showDebrief, toggleLang, render);
   root.append(dash.el);
   if (debriefShown) { debriefShown = false; showDebrief(); }
 }

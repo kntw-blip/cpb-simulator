@@ -1,5 +1,6 @@
 import {
-  State, Config, createState, step, alarms, Alarm, onCpb, requestAct, requestBga, giveDrug, DrugId, K,
+  State, Config, createState, step, alarms, Alarm, onCpb, requestAct, requestBga, giveDrug, DrugId, K, Site,
+  cdiStore, cdiCalibrate,
 } from './model';
 import { cabg } from './scenarios/cabg';
 
@@ -77,7 +78,9 @@ export class Sim {
     return !!this.wait && this.wait.kind === 'call' && this.wait.ids.includes(id);
   }
   act() { if (requestAct(this.s)) this.say('perf', 'm.act_sent'); }
-  bga() { if (requestBga(this.s)) this.say('perf', 'm.bga_sent'); }
+  bga(site: Site = 'a') { if (requestBga(this.s, site)) this.say('perf', site === 'a' ? 'm.bga_sent' : 'm.vbg_sent'); }
+  cdiStore() { this.say('perf', cdiStore(this.s) ? 'm.cdi_stored' : 'm.cdi_no_flow'); }
+  cdiCal() { this.say('perf', 'm.cdi_' + cdiCalibrate(this.s)); }
   drug(id: DrugId) { giveDrug(this.s, id); this.say('perf', 'd.' + id); }
   /** Number of completed grafts, for the surgical-field view. */
   graftCount(): number {
@@ -194,6 +197,7 @@ export class Sim {
       if (s.lab.lastAct) this.lastActOnCpb = Math.max(this.lastActOnCpb, s.lab.lastAct.tSample);
       if (s.lab.actPending) this.lastActOnCpb = Math.max(this.lastActOnCpb, s.lab.actPending.tSample);
       this.rule('act_interval', s.t - this.lastActOnCpb > 30 * 60, 1, 5, 600);
+      this.rule('cdi_cal', s.cdi.calT === null && s.t - s.tm.cpbStart! > 20 * 60, 1, 3, 1e9);
       this.rule('lv', p.lvDist > 0.8, 10, 5, 180);
       this.rule('suck_air', h.suckAir, 180, 2, 300);
       if (this.sustained('pool_say', g.pool > 300, 5, 90)) this.say('surgeon', 'm.pool', undefined, true);

@@ -55,10 +55,18 @@ export const K = {
   HEPARIN_PER_KG: 300,
 };
 
+export type Site = 'a' | 'v';
 export interface Bga {
-  t: number;
+  site: Site; tSample: number; t: number;
   ph: number; pco2: number; po2: number; hco3: number; be: number;
-  hct: number; hb: number; k: number; lac: number; sao2: number; svo2: number; temp: number;
+  hct: number; hb: number; k: number; lac: number; so2: number; temp: number;
+}
+/** Sensor offsets of the in-line blood gas monitor (displayed = true + offset). */
+export interface CdiSet { ph: number; pco2: number; po2: number; k: number; svo2: number; hct: number }
+export interface CdiReading {
+  art: { ph: number; pco2: number; po2: number; k: number; hco3: number; be: number; sao2: number; temp: number } | null;
+  ven: { so2: number; hct: number; hb: number; temp: number } | null;
+  do2i: number | null; vo2i: number | null;
 }
 export interface ActResult { tSample: number; t: number; value: number }
 export interface Sample {
@@ -77,7 +85,7 @@ export interface State {
     rhythm: Rhythm; contract: number; contractTarget: number; qHeart: number;
     svr: number; svrDrug: number;
     tNP: number; tBl: number;
-    pao2: number; paco2: number; sao2: number; svo2: number;
+    pao2: number; paco2: number; sao2: number; svo2: number; pvo2: number; pvco2: number;
     rso2: number; rso2Base: number;
     vo2: number; do2: number;
     k: number; lac: number; bicarb: number;
@@ -106,8 +114,10 @@ export interface State {
   };
   lab: {
     actPending: ActResult | null; lastAct: ActResult | null;
-    bgaPending: Bga | null; lastBga: Bga | null;
+    bgaPending: Bga | null; lastBga: Bga | null; // arterial
+    vbgPending: Bga | null; lastVbg: Bga | null; // venous
   };
+  cdi: { off: CdiSet; stored: (CdiSet & { t: number }) | null; calT: number | null; acc: number };
   tm: {
     heparinT: number | null; cpbStart: number | null; cpbEnd: number | null;
     clampStart: number | null; clampEnd: number | null;
@@ -156,7 +166,7 @@ export function createState(cfg: Config): State {
       rhythm: 'sinus', contract: 1, contractTarget: 1, qHeart: 4.5,
       svr: K.SVR0, svrDrug: 0,
       tNP: 36.2, tBl: 36.4,
-      pao2: 250, paco2: 40, sao2: 0.99, svo2: 0.74,
+      pao2: 250, paco2: 40, sao2: 0.99, svo2: 0.74, pvo2: 40, pvco2: 46,
       rso2: 70, rso2Base: 70,
       vo2: 180, do2: 800,
       k: 4.2, lac: 1.0, bicarb: 0,
@@ -180,7 +190,8 @@ export function createState(cfg: Config): State {
       artCannula: false, venCannula: false, ventPlaced: false, xclamp: false,
       heartLifted: false, venFactor: 1, bleed: 0, pool: 0, poolRbc: 0, step: 's.prep',
     },
-    lab: { actPending: null, lastAct: null, bgaPending: null, lastBga: null },
+    lab: { actPending: null, lastAct: null, bgaPending: null, lastBga: null, vbgPending: null, lastVbg: null },
+    cdi: { off: { ph: 0, pco2: 0, po2: 0, k: 0, svo2: 0, hct: 0 }, stored: null, calT: null, acc: 0 },
     tm: { heparinT: null, cpbStart: null, cpbEnd: null, clampStart: null, clampEnd: null },
     flags: {
       air: false, flowDown: false, lowFlowOkUntil: 0, rewarm: false,
@@ -191,6 +202,9 @@ export function createState(cfg: Config): State {
   };
   // Patient-to-patient heparin sensitivity (some patients need an additional dose).
   s.pt.heparinSens = 1.05 + rand(s) * 0.45;
+  // The in-line monitor starts with an uncorrected sensor error until it is calibrated against a sample.
+  const r = () => rand(s) * 2 - 1;
+  s.cdi.off = { ph: 0.035 * r(), pco2: 4 * r(), po2: 30 * r(), k: 0.35 * r(), svo2: 3.5 * r(), hct: 2.5 * r() };
   // Settle to a steady pre-bypass state.
   for (let i = 0; i < 20 * 120; i++) step(s, 0.05);
   s.t = 0;
@@ -363,6 +377,7 @@ export function step(s: State, dt: number): void {
   const pvo2 = 26.6 * Math.pow(Math.max(0.02, p.svo2) / Math.max(0.02, 1 - p.svo2), 1 / 2.7);
   const poOx = Math.max(pvo2, h.fio2 * 500 * eO2);
   const poLung = p.ventilated ? 250 : pvo2;
+  p.pvo2 = pvo2;
   if (qTot > 0.2) {
     const saT = (qpPos * sOx + p.qHeart * sLung) / qTot;
     const poT = saT > 0.97 ? (qpPos * poOx + p.qHeart * poLung) / qTot
@@ -380,6 +395,7 @@ export function step(s: State, dt: number): void {
   const va = (p.ventilated ? 3.3 * clamp(p.qHeart / 2, 0, 1) : 0)
     + (qpPos > 0.3 ? 0.95 * h.sweep * clamp(qpPos / 1.5, 0, 1) : 0);
   p.paco2 = clamp(p.paco2 + ((0.863 * vco2 - va * p.paco2) / 20) * dt / 60, 10, 120);
+  p.pvco2 = p.paco2 + clamp(6 * (vco2 / 150) * (4.5 / Math.max(qTot, 0.5)), 2, 25);
 
   // ---- cerebral oximetry ----
   const auto = p.map >= 50 ? 1 + Math.max(0, p.map - 100) * 0.005 : Math.max(0.15, p.map / 50);
@@ -402,6 +418,15 @@ export function step(s: State, dt: number): void {
   // ---- lab results arriving ----
   if (s.lab.actPending && s.t >= s.lab.actPending.t) { s.lab.lastAct = s.lab.actPending; s.lab.actPending = null; }
   if (s.lab.bgaPending && s.t >= s.lab.bgaPending.t) { s.lab.lastBga = s.lab.bgaPending; s.lab.bgaPending = null; }
+  if (s.lab.vbgPending && s.t >= s.lab.vbgPending.t) { s.lab.lastVbg = s.lab.vbgPending; s.lab.vbgPending = null; }
+
+  // ---- in-line monitor sensor drift (random walk, once per second) ----
+  s.cdi.acc += dt;
+  if (s.cdi.acc >= 1) {
+    s.cdi.acc -= 1;
+    const o = s.cdi.off, w = () => (rand(s) * 2 - 1) * 0.22; // ~ sd 0.13 per sqrt(s)
+    o.ph += 0.002 * w(); o.pco2 += 0.2 * w(); o.po2 += 1.5 * w(); o.k += 0.015 * w(); o.svo2 += 0.15 * w(); o.hct += 0.1 * w();
+  }
 }
 
 export const hco3Of = (s: State) => 24.5 - (s.pt.lac - 1) + s.pt.bicarb;
@@ -413,16 +438,70 @@ export function requestAct(s: State): boolean {
   return true;
 }
 
-export function requestBga(s: State): boolean {
-  if (s.lab.bgaPending) return false;
+const beOf = (ph: number, hco3: number) => 0.93 * (hco3 - 24.4 + 14.8 * (ph - 7.4));
+const phFrom = (hco3: number, pco2: number) => 6.1 + Math.log10(hco3 / (0.03 * pco2));
+
+/** Draw a blood sample for the blood gas analyser. Arterial: oxygenator outlet / arterial line. Venous: venous line. */
+export function requestBga(s: State, site: Site = 'a'): boolean {
+  if (site === 'a' ? s.lab.bgaPending : s.lab.vbgPending) return false;
   const p = s.pt;
-  const ph = phOf(s), hco3 = hco3Of(s);
-  s.lab.bgaPending = {
-    t: s.t + 60,
-    ph, pco2: p.paco2, po2: p.pao2, hco3, be: 0.93 * (hco3 - 24.4 + 14.8 * (ph - 7.4)),
-    hct: p.hct * 100, hb: p.hct * 33.3, k: p.k, lac: p.lac, sao2: p.sao2 * 100, svo2: p.svo2 * 100, temp: p.tNP,
+  const hco3 = hco3Of(s) + (site === 'v' ? 1 : 0);
+  const pco2 = site === 'a' ? p.paco2 : p.pvco2;
+  const ph = phFrom(hco3, pco2);
+  const b: Bga = {
+    site, tSample: s.t, t: s.t + 60,
+    ph, pco2, po2: site === 'a' ? p.pao2 : p.pvo2, hco3, be: beOf(ph, hco3),
+    hct: p.hct * 100, hb: p.hct * 33.3, k: p.k, lac: p.lac, so2: (site === 'a' ? p.sao2 : p.svo2) * 100, temp: p.tNP,
+  };
+  if (site === 'a') s.lab.bgaPending = b; else s.lab.vbgPending = b;
+  return true;
+}
+
+/** What the in-line monitor shows now (true value + sensor offset). Sides without blood flow read null. */
+export function cdiRead(s: State): CdiReading {
+  const p = s.pt, h = s.hlm, o = s.cdi.off;
+  const cpb = onCpb(s);
+  const art = cpb && h.flow > 0.3 ? (() => {
+    const hco3 = hco3Of(s), pco2 = Math.max(5, p.paco2 + o.pco2), ph = phOf(s) + o.ph, po2 = Math.max(10, p.pao2 + o.po2);
+    return { ph, pco2, po2, k: Math.max(1, p.k + o.k), hco3, be: beOf(ph, hco3), sao2: satOf(po2) * 100, temp: h.tArt };
+  })() : null;
+  const ven = cpb && h.venFlow > 0.3 ? (() => {
+    const hct = clamp(p.hct * 100 + o.hct, 5, 60);
+    return { so2: clamp(p.svo2 * 100 + o.svo2, 10, 99), hct, hb: hct / 3, temp: h.tVen };
+  })() : null;
+  let do2i: number | null = null, vo2i: number | null = null;
+  if (art && ven) {
+    do2i = h.flow * (1.34 * ven.hb * art.sao2 / 100 + 0.003 * art.po2) * 10 / s.bsa;
+    vo2i = Math.max(0, h.flow * 1.34 * ven.hb * (art.sao2 - ven.so2) / 100 * 10 / s.bsa);
+  }
+  return { art, ven, do2i, vo2i };
+}
+
+/** "Store": remember the displayed values at the moment the calibration samples are drawn. */
+export function cdiStore(s: State): boolean {
+  const r = cdiRead(s);
+  if (!r.art && !r.ven) return false;
+  s.cdi.stored = {
+    t: s.t,
+    ph: r.art ? r.art.ph : NaN, pco2: r.art ? r.art.pco2 : NaN, po2: r.art ? r.art.po2 : NaN, k: r.art ? r.art.k : NaN,
+    svo2: r.ven ? r.ven.so2 : NaN, hct: r.ven ? r.ven.hct : NaN,
   };
   return true;
+}
+
+/** In-vivo recalibration: shift each sensor by (stored display - analyser result). */
+export function cdiCalibrate(s: State): 'ok' | 'no_store' | 'no_sample' {
+  const st = s.cdi.stored, o = s.cdi.off;
+  if (!st) return 'no_store';
+  const a = s.lab.lastBga && s.lab.lastBga.tSample >= st.t ? s.lab.lastBga : null;
+  const v = s.lab.lastVbg && s.lab.lastVbg.tSample >= st.t ? s.lab.lastVbg : null;
+  if (!a && !v) return 'no_sample';
+  const fix = (key: keyof CdiSet, lab: number) => { if (isFinite(st[key])) o[key] -= st[key] - lab; };
+  if (a) { fix('ph', a.ph); fix('pco2', a.pco2); fix('po2', a.po2); fix('k', a.k); }
+  if (v) { fix('svo2', v.so2); fix('hct', v.hct); } else if (a) fix('hct', a.hct);
+  s.cdi.stored = null;
+  s.cdi.calT = s.t;
+  return 'ok';
 }
 
 export function giveDrug(s: State, id: DrugId): void {

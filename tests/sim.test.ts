@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { Sim } from '../src/sim/engine';
-import { createState, defaultConfig, step, Config } from '../src/sim/model';
+import { createState, defaultConfig, step, Config, cdiRead, cdiStore, cdiCalibrate, requestBga } from '../src/sim/model';
 import { runScenario } from './autopilot';
 
 describe('patient model', () => {
@@ -32,6 +32,36 @@ describe('patient model', () => {
     s.surg.artCannula = true; s.hlm.artOpen = true; s.hlm.rpm = 0;
     for (let i = 0; i < 40; i++) step(s, 0.05);
     expect(s.hlm.flow).toBeLessThan(-0.2);
+  });
+});
+
+describe('in-line blood gas monitor', () => {
+  it('reads with an offset until calibrated against arterial and venous samples', () => {
+    const s = createState(defaultConfig);
+    s.surg.artCannula = s.surg.venCannula = true;
+    s.pt.heparin = 300 * 65; s.tm.cpbStart = 0;
+    s.hlm.artOpen = true; s.hlm.venOcc = 1; s.hlm.rpm = 152; s.hlm.sweep = 2.5; s.hlm.fio2 = 0.6;
+    for (let i = 0; i < 20 * 240; i++) step(s, 0.05);
+    s.cdi.off = { ph: 0.04, pco2: 5, po2: 30, k: 0.4, svo2: 4, hct: 3 };
+    expect(cdiCalibrate(s)).toBe('no_store');
+    expect(cdiStore(s)).toBe(true);
+    expect(cdiCalibrate(s)).toBe('no_sample');
+    requestBga(s, 'a'); requestBga(s, 'v');
+    for (let i = 0; i < 20 * 70; i++) step(s, 0.05);
+    expect(s.lab.lastVbg!.po2).toBeLessThan(60);
+    expect(s.lab.lastVbg!.pco2).toBeGreaterThan(s.lab.lastBga!.pco2);
+    expect(cdiCalibrate(s)).toBe('ok');
+    const r = cdiRead(s);
+    expect(Math.abs(r.art!.pco2 - s.pt.paco2)).toBeLessThan(1.5);
+    expect(Math.abs(r.ven!.so2 - s.pt.svo2 * 100)).toBeLessThan(1.5);
+    expect(Math.abs(r.ven!.hct - s.pt.hct * 100)).toBeLessThan(1);
+  });
+
+  it('shows nothing without blood flow', () => {
+    const s = createState(defaultConfig);
+    const r = cdiRead(s);
+    expect(r.art).toBeNull();
+    expect(r.ven).toBeNull();
   });
 });
 

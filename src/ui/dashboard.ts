@@ -1,10 +1,12 @@
 import { Sim } from '../sim/engine';
-import { K, DrugId, CHECKLIST_N, onCpb } from '../sim/model';
+import { K, DrugId, CHECKLIST_N, cdiRead, Bga } from '../sim/model';
 import { t, hints } from '../i18n';
 import { h, fmtTime, fitCanvas } from './dom';
 import { WaveMonitor } from './waves';
 import { buildField } from './field';
 import { buildCircuit } from './circuit';
+
+const LAYOUT_KEY = 'cpb-layout-v2';
 
 interface StepperOpts {
   label: string; unit: string; min: number; max: number; step: number; big?: number;
@@ -26,12 +28,116 @@ export class Dashboard {
   private lastAlarmKey = '?';
   private slowAcc = 0;
 
-  constructor(private sim: Sim, private onEnd: () => void, private onLang: () => void) {
+  constructor(private sim: Sim, private onEnd: () => void, private onLang: () => void, private onRelayout: () => void) {
     this.el = h('div', { class: 'dash' },
       this.topBar(),
       (this.alarmBar = h('div', { class: 'alarm-bar', role: 'status', 'aria-live': 'polite' })),
-      h('main', { class: 'grid' }, this.leftCol(), this.centerCol(), this.rightCol()),
+      this.layoutBar(),
+      (this.grid = h('main', { class: 'grid' }, this.leftCol(), this.centerCol(), this.rightCol())),
     );
+    this.initLayout();
+  }
+
+  // ------------------------------------------------------------ rearrangeable panels
+  private grid!: HTMLElement;
+  private editing = false;
+  private wasPaused = false;
+  private selected: HTMLElement | null = null;
+
+  private cardEls(): HTMLElement[] { return Array.from(this.grid.querySelectorAll<HTMLElement>('.card')); }
+
+  private layoutBar() {
+    return h('div', { class: 'layout-bar' },
+      h('span', null, t('u.layout_help')),
+      h('button', { type: 'button', class: 'ghost', onclick: () => { try { localStorage.removeItem(LAYOUT_KEY); } catch { /* ignore */ } this.setEditing(false); this.onRelayout(); } }, t('u.layout_reset')),
+      h('button', { type: 'button', class: 'sp-btn on', onclick: () => this.setEditing(false) }, t('u.layout_done')),
+    );
+  }
+
+  private setEditing(on: boolean) {
+    if (on === this.editing) return;
+    this.editing = on;
+    this.el.classList.toggle('layout-edit', on);
+    if (on) { this.wasPaused = this.sim.paused; this.sim.paused = true; }
+    else if (!this.sim.criticalPending && !this.sim.finished) this.sim.paused = this.wasPaused;
+    this.select(null);
+    for (const c of this.cardEls()) { if (on) c.tabIndex = 0; else c.removeAttribute('tabindex'); }
+  }
+
+  private select(c: HTMLElement | null) {
+    this.selected?.classList.remove('selected');
+    this.selected = c;
+    c?.classList.add('selected');
+  }
+
+  private swap(a: HTMLElement, b: HTMLElement) {
+    if (a === b) return;
+    const ph = document.createComment('');
+    a.replaceWith(ph); b.replaceWith(a); ph.replaceWith(b);
+    try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(this.cardEls().map((c) => c.dataset.card))); } catch { /* ignore */ }
+  }
+
+  private tap(card: HTMLElement) {
+    if (this.selected && this.selected !== card) { this.swap(this.selected, card); this.select(null); }
+    else this.select(this.selected === card ? null : card);
+  }
+
+  private initLayout() {
+    const cards = this.cardEls();
+    cards.forEach((c, i) => { c.dataset.card = 'c' + i; });
+    // restore a saved arrangement (a permutation of the default slots)
+    try {
+      const saved: unknown = JSON.parse(localStorage.getItem(LAYOUT_KEY) || 'null');
+      const ids = cards.map((c) => c.dataset.card!);
+      if (Array.isArray(saved) && saved.length === ids.length && ids.every((id) => saved.includes(id))) {
+        const byId = new Map(cards.map((c) => [c.dataset.card!, c]));
+        const slots = cards.map((c) => { const ph = document.createComment(''); c.replaceWith(ph); return ph; });
+        saved.forEach((id, i) => slots[i].replaceWith(byId.get(id as string)!));
+      }
+    } catch { /* storage unavailable or corrupt: keep the default layout */ }
+
+    let drag: { card: HTMLElement; x: number; y: number; touch: boolean; moving: boolean } | null = null;
+    let ghost: HTMLElement | null = null;
+    let target: HTMLElement | null = null;
+    const setTarget = (c: HTMLElement | null) => { target?.classList.remove('drop-target'); target = c; c?.classList.add('drop-target'); };
+    const end = () => { ghost?.remove(); ghost = null; setTarget(null); drag?.card.classList.remove('dragging'); drag = null; };
+    const cardAt = (x: number, y: number) => (document.elementFromPoint(x, y)?.closest('.card') ?? null) as HTMLElement | null;
+
+    this.grid.addEventListener('pointerdown', (e) => {
+      if (!this.editing) return;
+      const card = (e.target as HTMLElement).closest<HTMLElement>('.card');
+      if (!card) return;
+      drag = { card, x: e.clientX, y: e.clientY, touch: e.pointerType === 'touch', moving: false };
+      if (!drag.touch) e.preventDefault();
+    });
+    window.addEventListener('pointermove', (e) => {
+      if (!drag || drag.touch) return;
+      if (!drag.moving && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 8) {
+        drag.moving = true;
+        drag.card.classList.add('dragging');
+        this.select(null);
+        ghost = h('div', { class: 'ghost-card' }, drag.card.querySelector('h2')?.textContent ?? '');
+        document.body.append(ghost);
+      }
+      if (drag.moving && ghost) {
+        ghost.style.left = e.clientX + 12 + 'px';
+        ghost.style.top = e.clientY + 12 + 'px';
+        const c = cardAt(e.clientX, e.clientY);
+        setTarget(c && c !== drag.card && this.grid.contains(c) ? c : null);
+      }
+    });
+    window.addEventListener('pointerup', (e) => {
+      if (!drag) return;
+      if (drag.moving) { if (target) this.swap(drag.card, target); }
+      else if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 10) this.tap(drag.card);
+      end();
+    });
+    window.addEventListener('pointercancel', end);
+    this.grid.addEventListener('keydown', (e) => {
+      if (!this.editing || (e.key !== 'Enter' && e.key !== ' ')) return;
+      const card = (e.target as HTMLElement).closest<HTMLElement>('.card');
+      if (card && e.target === card) { e.preventDefault(); this.tap(card); }
+    });
   }
 
   // ------------------------------------------------------------ helpers
@@ -90,12 +196,12 @@ export class Dashboard {
     const speeds = [1, 2, 5, 10, 30];
     const speedBtns = speeds.map((sp) => {
       const b = h('button', { type: 'button', class: 'sp-btn' }, '×' + sp);
-      b.addEventListener('click', () => { sim.speed = sp; sim.paused = false; });
+      b.addEventListener('click', () => { sim.speed = sp; if (!this.editing && !sim.criticalPending) sim.paused = false; });
       this.bind(() => { b.classList.toggle('on', sim.speed === sp && !sim.paused); });
       return b;
     });
     const pause = h('button', { type: 'button', class: 'sp-btn pause' });
-    pause.addEventListener('click', () => { if (!sim.criticalPending) sim.paused = !sim.paused; });
+    pause.addEventListener('click', () => { if (!sim.criticalPending && !this.editing) sim.paused = !sim.paused; });
     this.bind(() => { pause.textContent = sim.paused ? '▶ ' + t('u.resume') : '❚❚ ' + t('u.pause'); pause.classList.toggle('on', sim.paused); });
     const auto = h('input', { type: 'checkbox', id: 'autoslow' });
     auto.checked = sim.autoSlow;
@@ -114,6 +220,7 @@ export class Dashboard {
         h('label', { class: 'chk', for: 'autoslow' }, auto, t('u.autoslow')),
       ),
       h('div', { class: 'top-right' },
+        h('button', { type: 'button', class: 'ghost', onclick: () => this.setEditing(!this.editing) }, '⇄ ' + t('u.layout')),
         h('button', { type: 'button', class: 'ghost', onclick: () => this.onLang() }, t('u.lang')),
         h('button', { type: 'button', class: 'ghost', onclick: () => this.onEnd() }, t('u.finish_now')),
       ),
@@ -247,17 +354,50 @@ export class Dashboard {
     const rootLabel = cpCard.querySelector('.rootp .tl')!;
     this.bind(() => { rootLabel.textContent = cp.route === 'ante' ? t('u.cp_rootp_ante') : t('u.cp_rootp_retro'); });
 
-    const inline = this.card(t('u.inline'),
-      h('div', { class: 'tiles' },
-        this.tile('SvO₂', () => (hl.venFlow > 0.3 ? String(Math.round(p.svo2 * 100)) : '--'), '%', 'big'),
-        this.tile('Hct', () => (onCpb(s) ? (p.hct * 100).toFixed(0) : '--'), '%'),
-        this.tile('DO₂i', () => (onCpb(s) ? String(Math.round(p.do2 / s.bsa)) : '--'), 'mL/min/m²'),
+    // in-line blood gas monitor (shows sensor values, which may differ from the analyser until calibrated)
+    let rd = cdiRead(s);
+    this.bind(() => { rd = cdiRead(s); });
+    const f = (v: number | null | undefined, d = 0) => (v == null || !isFinite(v) ? '---' : v.toFixed(d));
+    const cdiStatus = () => {
+      const c = s.cdi;
+      if (c.stored) return `${t('u.cdi_stored')}（${fmtTime(s.t - c.stored.t)}）`;
+      return c.calT === null ? t('u.cdi_uncal') : `${t('u.cdi_cal_done')}（${t('u.min_ago', { m: Math.floor((s.t - c.calT) / 60) })}）`;
+    };
+    const cdi = this.card(t('u.cdi'),
+      h('div', { class: 'cdi-status' }, this.val(cdiStatus)),
+      h('h3', { class: 'art-h' }, t('u.cdi_art')),
+      h('div', { class: 'tiles cdi' },
+        this.tile('pH', () => f(rd.art?.ph, 2)),
+        this.tile('PCO₂', () => f(rd.art?.pco2), 'mmHg'),
+        this.tile('PO₂', () => f(rd.art?.po2), 'mmHg'),
+        this.tile('K⁺', () => f(rd.art?.k, 1), 'mEq/L'),
+        this.tile('HCO₃⁻', () => f(rd.art?.hco3, 1)),
+        this.tile('BE', () => f(rd.art?.be, 1)),
+        this.tile('SaO₂', () => f(rd.art?.sao2), '%'),
+        this.tile(t('u.t_art'), () => f(rd.art?.temp, 1), '°C', 'temp'),
       ),
-      this.stepper({ label: t('u.hemo'), unit: 'mL/min', min: 0, max: 80, step: 10, get: () => hl.hemo, set: (v) => { hl.hemo = v; } }),
+      h('h3', { class: 'ven-h' }, t('u.cdi_ven')),
+      h('div', { class: 'tiles cdi' },
+        this.tile('SvO₂', () => f(rd.ven?.so2), '%', 'big'),
+        this.tile('Hct', () => f(rd.ven?.hct), '%'),
+        this.tile('Hb', () => f(rd.ven?.hb, 1), 'g/dL'),
+        this.tile(t('u.t_ven'), () => f(rd.ven?.temp, 1), '°C', 'temp'),
+        this.tile('DO₂i', () => f(rd.do2i), 'mL/min/m²'),
+        this.tile('VO₂i', () => f(rd.vo2i), 'mL/min/m²'),
+      ),
+      h('div', { class: 'row' },
+        h('button', { type: 'button', class: 'toggle', onclick: () => sim.cdiStore() }, t('u.cdi_store')),
+        h('button', { type: 'button', class: 'toggle', onclick: () => sim.cdiCal() }, t('u.cdi_calibrate')),
+      ),
+      h('div', { class: 'note' }, t('u.cdi_note')),
+    );
+
+    const hemo = this.card(t('u.hemo'),
+      this.stepper({ label: t('u.hemo_rate'), unit: 'mL/min', min: 0, max: 80, step: 10, get: () => hl.hemo, set: (v) => { hl.hemo = v; } }),
       h('div', { class: 'note' }, this.val(() => `${t('u.removed')}: ${Math.round(hl.hemoTotal)} mL`)),
     );
 
-    return h('div', { class: 'col center' }, circuitCard, h('div', { class: 'cards' }, pump, ven, gas, hc, cpCard, sv, inline));
+    return h('div', { class: 'col center' }, circuitCard, h('div', { class: 'cards' }, pump, ven, gas, hc, cdi, cpCard, sv, hemo));
   }
 
   // ------------------------------------------------------------ right column: team and tasks
@@ -276,23 +416,28 @@ export class Dashboard {
       const last = l.lastAct ? `${l.lastAct.value >= 999 ? '>999' : l.lastAct.value} s（${ago(l.lastAct.tSample)}）` : t('u.none');
       return l.actPending ? `${last} ・ ${t('u.pending')}` : last;
     };
-    const bgaEl = h('div', { class: 'bga' });
-    let bgaKey = '';
-    this.bind(() => {
-      const b = s.lab.lastBga;
-      const key = (b ? b.t : 'n') + (s.lab.bgaPending ? 'p' : '') + Math.floor(s.t / 60);
-      if (key === bgaKey) return;
-      bgaKey = key;
-      bgaEl.textContent = '';
-      if (!b) { bgaEl.append(s.lab.bgaPending ? t('u.pending') : t('u.none')); return; }
-      const rows: [string, string][] = [
-        ['pH', b.ph.toFixed(2)], ['PaCO₂', b.pco2.toFixed(0)], ['PaO₂', b.po2.toFixed(0)], ['HCO₃⁻', b.hco3.toFixed(1)],
-        ['BE', b.be.toFixed(1)], ['Hct', b.hct.toFixed(0) + '%'], ['Hb', b.hb.toFixed(1)], ['K⁺', b.k.toFixed(1)],
-        ['Lac', b.lac.toFixed(1)], ['SaO₂', b.sao2.toFixed(0) + '%'], ['SvO₂', b.svo2.toFixed(0) + '%'],
-      ];
-      bgaEl.append(h('div', { class: 'bga-grid' }, ...rows.map(([k, v]) => h('div', null, h('span', { class: 'tl' }, k), h('b', null, v)))),
-        h('div', { class: 'note' }, ago(b.t) + (s.lab.bgaPending ? ' ・ ' + t('u.pending') : '')));
-    });
+    const bgaView = (title: string, cls: string, last: () => Bga | null, pending: () => Bga | null) => {
+      const box = h('div', { class: 'bga' });
+      let key = '';
+      this.bind(() => {
+        const b = last();
+        const k = (b ? b.t : 'n') + (pending() ? 'p' : '') + Math.floor(s.t / 60);
+        if (k === key) return;
+        key = k;
+        box.textContent = '';
+        if (!b) { box.append(h('div', { class: 'note' }, pending() ? t('u.pending') : t('u.none'))); return; }
+        const rows: [string, string][] = [
+          ['pH', b.ph.toFixed(2)], ['PCO₂', b.pco2.toFixed(0)], ['PO₂', b.po2.toFixed(0)], ['HCO₃⁻', b.hco3.toFixed(1)],
+          ['BE', b.be.toFixed(1)], ['SO₂', b.so2.toFixed(0) + '%'], ['Hct', b.hct.toFixed(0) + '%'], ['Hb', b.hb.toFixed(1)],
+          ['K⁺', b.k.toFixed(1)], ['Lac', b.lac.toFixed(1)],
+        ];
+        box.append(h('div', { class: 'bga-grid' }, ...rows.map(([kk, v]) => h('div', null, h('span', { class: 'tl' }, kk), h('b', null, v)))),
+          h('div', { class: 'note' }, `${t('u.sampled')} ${fmtTime(b.tSample)}（${ago(b.tSample)}）` + (pending() ? ' ・ ' + t('u.pending') : '')));
+      });
+      return h('div', null, h('div', { class: 'tl bga-title ' + cls }, title), box);
+    };
+    const bgaA = bgaView(t('u.bga_a'), 'art-h', () => s.lab.lastBga, () => s.lab.bgaPending);
+    const bgaV = bgaView(t('u.bga_v'), 'ven-h', () => s.lab.lastVbg, () => s.lab.vbgPending);
 
     return h('div', { class: 'col right' },
       h('section', { class: 'card' }, h('h2', null, t('u.phase')), this.dyn.phase, this.dyn.guide),
@@ -300,12 +445,14 @@ export class Dashboard {
       this.card(t('u.actions'),
         h('div', { class: 'act-grid' },
           h('button', { type: 'button', class: 'act-btn lab', onclick: () => sim.act() }, t('u.act_btn')),
-          h('button', { type: 'button', class: 'act-btn lab', onclick: () => sim.bga() }, t('u.bga_btn')),
+          h('span', null),
+          h('button', { type: 'button', class: 'act-btn lab art', onclick: () => sim.bga('a') }, t('u.bga_btn_a')),
+          h('button', { type: 'button', class: 'act-btn lab ven', onclick: () => sim.bga('v') }, t('u.bga_btn_v')),
           drug('phenyl'), drug('nicard'), drug('cryst100'), drug('cryst250'), drug('rbc'), drug('bicarb'), drug('heparin'),
         ),
         h('h3', null, t('u.labs')),
         h('div', { class: 'lab-line' }, h('span', { class: 'tl' }, t('u.act')), this.val(actTxt)),
-        h('div', { class: 'tl' }, t('u.bga')), bgaEl,
+        bgaA, bgaV,
       ),
     );
   }
